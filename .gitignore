@@ -3,10 +3,11 @@ data/raw/
 data/processed/images/
 data/processed/labels/
 
-# Model weights
+# Model weights (Ausnahme: versionierte v0-Release-Gewichte)
 *.pt
 models/detection/*.pt
 models/homography/*.pt
+!models/yolov8n_teamtrack_tiles_v0.pt
 
 # Training runs
 runs/
@@ -37,3 +38,22 @@ api/results/
 # Environment
 .env
 *.log
+.venv/
+
+# Pipeline-Daten & Zwischenartefakte — reproduzierbar (pipeline/download_teamtrack.py)
+teamtrack/
+dataset/
+*.parquet
+*.mkv
+clip5m*.mp4
+out_*.mp4
+demo_annotated.mp4
+ref_t*.png
+grid_half.png
+corner_*.png
+tile_label_check.png
+tt_frame0*.png
+tt_detect_*.png
+overlay_check*.png
+homography.npz
+points.json
