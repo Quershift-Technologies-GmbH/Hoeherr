@@ -60,25 +60,25 @@ class AppearanceExtractor:
         ])
         self._torch = torch
 
-    @torch.no_grad()
     def extract(self, crops: list[np.ndarray]) -> np.ndarray:
         """Extrahiere Embeddings für eine Liste von BGR-Crops.
         Returns: (N, D) float32 numpy array, L2-normiert."""
         import torch
         if len(crops) == 0:
             return np.zeros((0, 576), dtype=np.float32)
-        tensors = []
-        for c in crops:
-            if c.size == 0 or min(c.shape[:2]) < 4:
-                tensors.append(self.transform(np.zeros((64, 64, 3), dtype=np.uint8)))
-            else:
-                rgb = cv2.cvtColor(c, cv2.COLOR_BGR2RGB)
-                tensors.append(self.transform(rgb))
-        batch = torch.stack(tensors).to(self.device)
-        emb = self.model(batch).cpu().numpy()
-        # L2-Normierung
-        norms = np.linalg.norm(emb, axis=1, keepdims=True) + 1e-8
-        return (emb / norms).astype(np.float32)
+        with torch.no_grad():
+            tensors = []
+            for c in crops:
+                if c.size == 0 or min(c.shape[:2]) < 4:
+                    tensors.append(self.transform(np.zeros((64, 64, 3), dtype=np.uint8)))
+                else:
+                    rgb = cv2.cvtColor(c, cv2.COLOR_BGR2RGB)
+                    tensors.append(self.transform(rgb))
+            batch = torch.stack(tensors).to(self.device)
+            emb = self.model(batch).cpu().numpy()
+            # L2-Normierung
+            norms = np.linalg.norm(emb, axis=1, keepdims=True) + 1e-8
+            return (emb / norms).astype(np.float32)
 
 
 def _get_extractor(device: str = "cpu") -> AppearanceExtractor:
@@ -115,9 +115,9 @@ def compute_track_embeddings(df: pd.DataFrame, video_path: str,
                 continue
             x, y, w, h = row.x_px, row.y_px, row.w_px, row.h_px
             x1 = max(0, int(x - w / 2))
-            y1 = max(0, int(y - h / 2))
+            y1 = max(0, int(y - h))
             x2 = min(frame.shape[1], int(x + w / 2))
-            y2 = min(frame.shape[0], int(y + h / 2))
+            y2 = min(frame.shape[0], int(y))
             crop = frame[y1:y2, x1:x2]
             if crop.size > 0:
                 crops.append(crop)
