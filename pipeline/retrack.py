@@ -7,7 +7,8 @@ danach in der Nähe -> gleiche Person (statische Nadir-Kamera macht das robust).
 
     .venv/bin/python pipeline/retrack.py --raw detections_raw.parquet \
         --homography homography.npz --out positions_cv2.parquet \
-        --min-conf 0.10 --activation 0.30 --buffer 60 --stitch-gap 4.0 --stitch-dist 2.5
+        --min-conf 0.05 --activation 0.20 --buffer 60 --stitch-gap 4.0 --stitch-dist 2.5
+    (Defaults sind jetzt GT-validiert — obige Flags nur nötig wenn man abweichen will)
 """
 import argparse
 
@@ -79,7 +80,9 @@ def replay_bytetrack(raw: pd.DataFrame, fps_eff: float, activation: float,
 
 def stitch_tracks(df: pd.DataFrame, H: np.ndarray, max_gap_s: float,
                   max_dist_m: float) -> pd.DataFrame:
-    """Greedy: Track-Ende -> nächster Track-Start (zeitlich) im Umkreis mergen."""
+    """Greedy: Track-Ende -> nächster Track-Start (zeitlich) im Umkreis mergen.
+    Velocity-aware: nutzt Geschwindigkeitsvektor am Track-Ende für
+    Positionsprädiktion über die Lücke hinweg."""
     pts = df[["x_px", "y_px"]].to_numpy(np.float64).reshape(-1, 1, 2)
     XY = cv2.perspectiveTransform(pts, H).reshape(-1, 2)
     df = df.copy()
@@ -88,11 +91,23 @@ def stitch_tracks(df: pd.DataFrame, H: np.ndarray, max_gap_s: float,
     info = []
     for tid, g in df.groupby("tracker_id"):
         g = g.sort_values("t_sec")
+        # Velocity at track end (last 5 frames or available)
+        tail = g.tail(min(5, len(g)))
+        if len(tail) >= 2:
+            dt_tail = tail.t_sec.iloc[-1] - tail.t_sec.iloc[0]
+            if dt_tail > 0:
+                vx = (tail.X.iloc[-1] - tail.X.iloc[0]) / dt_tail
+                vy = (tail.Y.iloc[-1] - tail.Y.iloc[0]) / dt_tail
+            else:
+                vx, vy = 0.0, 0.0
+        else:
+            vx, vy = 0.0, 0.0
         info.append({
             "tid": int(tid),
             "t0": g.t_sec.iloc[0], "t1": g.t_sec.iloc[-1],
             "x0": g.X.iloc[0], "y0": g.Y.iloc[0],
             "x1": g.X.iloc[-1], "y1": g.Y.iloc[-1],
+            "vx": vx, "vy": vy,
         })
     info.sort(key=lambda r: r["t0"])
 
@@ -117,7 +132,13 @@ def stitch_tracks(df: pd.DataFrame, H: np.ndarray, max_gap_s: float,
                 continue
             if dt < -0.15:
                 continue
-            d = np.hypot(start["x0"] - end["x1"], start["y0"] - end["y1"])
+            # Raw distance (position-only fallback)
+            d_raw = np.hypot(start["x0"] - end["x1"], start["y0"] - end["y1"])
+            # Velocity-predicted position over the gap
+            pred_x = end["x1"] + end["vx"] * dt
+            pred_y = end["y1"] + end["vy"] * dt
+            d_pred = np.hypot(start["x0"] - pred_x, start["y0"] - pred_y)
+            d = min(d_raw, d_pred)
             if d > max_dist_m:
                 continue
             score = d + dt * 0.3
@@ -139,16 +160,16 @@ def main():
     ap.add_argument("--raw", default="detections_raw.parquet")
     ap.add_argument("--homography", default="homography.npz")
     ap.add_argument("--out", default="positions_cv2.parquet")
-    ap.add_argument("--min-conf", type=float, default=0.10)
-    ap.add_argument("--activation", type=float, default=0.30)
+    ap.add_argument("--min-conf", type=float, default=0.05)
+    ap.add_argument("--activation", type=float, default=0.20)
     ap.add_argument("--buffer", type=int, default=60, help="lost_track_buffer (Frames)")
     ap.add_argument("--match", type=float, default=0.8)
-    ap.add_argument("--min-consecutive", type=int, default=2)
-    ap.add_argument("--stitch-gap", type=float, default=0.0, help="0 = kein Stitching")
+    ap.add_argument("--min-consecutive", type=int, default=1)
+    ap.add_argument("--stitch-gap", type=float, default=4.0, help="0 = kein Stitching")
     ap.add_argument("--stitch-dist", type=float, default=2.5)
-    ap.add_argument("--inflate", type=float, default=1.0,
+    ap.add_argument("--inflate", type=float, default=3.5,
                     help="Box-Inflation nur für IoU-Matching (z.B. 2.5)")
-    ap.add_argument("--dedup-m", type=float, default=0.0,
+    ap.add_argument("--dedup-m", type=float, default=0.6,
                     help="Duplikat-Radius in Metern (z.B. 0.6), 0 = aus")
     args = ap.parse_args()
 
