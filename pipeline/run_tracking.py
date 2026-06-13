@@ -41,6 +41,37 @@ def jersey_hsv(frame: np.ndarray, xyxy: np.ndarray) -> tuple[float, float, float
     return (float(med[0]), float(med[1]), float(med[2]))
 
 
+def _nms_merge(detections: sv.Detections, iou_threshold: float = 0.5) -> sv.Detections:
+    """Greedy NMS über eine Liste von Detections (nach Multi-Scale-Merge)."""
+    if len(detections) == 0:
+        return detections
+    xyxy = detections.xyxy
+    confs = detections.confidence
+    order = np.argsort(-confs)
+    keep = []
+    while len(order) > 0:
+        i = order[0]
+        keep.append(i)
+        if len(order) == 1:
+            break
+        rest = order[1:]
+        xx1 = np.maximum(xyxy[i, 0], xyxy[rest, 0])
+        yy1 = np.maximum(xyxy[i, 1], xyxy[rest, 1])
+        xx2 = np.minimum(xyxy[i, 2], xyxy[rest, 2])
+        yy2 = np.minimum(xyxy[i, 3], xyxy[rest, 3])
+        inter = np.maximum(0, xx2 - xx1) * np.maximum(0, yy2 - yy1)
+        area_i = (xyxy[i, 2] - xyxy[i, 0]) * (xyxy[i, 3] - xyxy[i, 1])
+        area_r = (xyxy[rest, 2] - xyxy[rest, 0]) * (xyxy[rest, 3] - xyxy[rest, 1])
+        iou = inter / (area_i + area_r - inter + 1e-6)
+        order = rest[iou <= iou_threshold]
+    idx = np.array(keep)
+    return sv.Detections(
+        xyxy=xyxy[idx],
+        confidence=confs[idx],
+        class_id=detections.class_id[idx] if detections.class_id is not None else None,
+    )
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--source", required=True)
@@ -50,6 +81,8 @@ def main():
     ap.add_argument("--imgsz", type=int, default=1536)
     ap.add_argument("--stride", type=int, default=3, help="jeden n-ten Frame verarbeiten")
     ap.add_argument("--slice", action="store_true", help="SAHI-Tiling (sv.InferenceSlicer)")
+    ap.add_argument("--multi-scale", action="store_true",
+                    help="Multi-Scale SAHI: 2 Durchläufe (320px + 640px Tiles) mit NMS-Merge")
     ap.add_argument("--device", default="mps")
     ap.add_argument("--max-frames", type=int, default=0, help="Limit auf verarbeitete (gesampelte) Frames, 0=alle")
     ap.add_argument("--video-out", default="", help="optionales annotiertes Kontrollvideo")
@@ -73,7 +106,37 @@ def main():
                             device=args.device, classes=[PERSON], verbose=False)[0]
         return sv.Detections.from_ultralytics(res)
 
-    if args.slice:
+    if args.multi_scale:
+        # ---- Multi-Scale SAHI: 2 Tile-Größen + NMS-Merge ----
+        slicer_small = sv.InferenceSlicer(
+            callback=yolo_detect, slice_wh=(320, 320),
+            overlap_wh=(64, 64), iou_threshold=0.5,
+        )
+        slicer_large = sv.InferenceSlicer(
+            callback=yolo_detect, slice_wh=(640, 640),
+            overlap_wh=(128, 128), iou_threshold=0.5,
+        )
+
+        def multi_scale_detect(frame: np.ndarray) -> sv.Detections:
+            det_small = slicer_small(frame)
+            det_large = slicer_large(frame)
+            if len(det_small) == 0:
+                return det_large
+            if len(det_large) == 0:
+                return det_small
+            merged = sv.Detections(
+                xyxy=np.vstack([det_small.xyxy, det_large.xyxy]),
+                confidence=np.concatenate([det_small.confidence, det_large.confidence]),
+                class_id=np.concatenate([
+                    det_small.class_id if det_small.class_id is not None else np.zeros(len(det_small), dtype=int),
+                    det_large.class_id if det_large.class_id is not None else np.zeros(len(det_large), dtype=int),
+                ]),
+            )
+            return _nms_merge(merged, iou_threshold=0.5)
+
+        detect = multi_scale_detect
+        print("[info] Multi-Scale SAHI AKTIV (320px + 640px Tiles, NMS-Merge)")
+    elif args.slice:
         slicer = sv.InferenceSlicer(callback=yolo_detect, slice_wh=(640, 640),
                                     overlap_wh=(128, 128), iou_threshold=0.5)
         detect = slicer
