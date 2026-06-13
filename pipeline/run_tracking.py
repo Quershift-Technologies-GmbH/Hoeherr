@@ -72,6 +72,35 @@ def _nms_merge(detections: sv.Detections, iou_threshold: float = 0.5) -> sv.Dete
     )
 
 
+def calibrate_confidence(detections: sv.Detections, temperature: float) -> sv.Detections:
+    """Temperature Scaling für Detection-Confidences.
+
+    Wendet Platt-Scaling an: logit = log(p/(1-p)), dann logit/T, dann sigmoid.
+    T > 1 macht Konfidenzwerte konservativer (näher an 0.5),
+    T < 1 macht sie extremer. T = 1.0 = keine Änderung.
+
+    Args:
+        detections: sv.Detections mit confidence-Array
+        temperature: Temperatur-Parameter (empfohlen: 1.2-2.0 für typische YOLO-Modelle)
+
+    Returns:
+        sv.Detections mit kalibrierten Konfidenzwerten
+    """
+    if temperature == 1.0 or len(detections) == 0:
+        return detections
+    confs = detections.confidence.copy()
+    # Clamp um numerische Stabilität zu gewährleisten
+    confs = np.clip(confs, 1e-7, 1.0 - 1e-7)
+    # Inverse Sigmoid (Logit)
+    logits = np.log(confs / (1.0 - confs))
+    # Temperature Scaling
+    logits_scaled = logits / temperature
+    # Sigmoid
+    calibrated = 1.0 / (1.0 + np.exp(-logits_scaled))
+    detections.confidence = calibrated.astype(np.float32)
+    return detections
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--source", required=True)
@@ -83,6 +112,9 @@ def main():
     ap.add_argument("--slice", action="store_true", help="SAHI-Tiling (sv.InferenceSlicer)")
     ap.add_argument("--multi-scale", action="store_true",
                     help="Multi-Scale SAHI: 2 Durchläufe (320px + 640px Tiles) mit NMS-Merge")
+    ap.add_argument("--temperature", type=float, default=1.5,
+                    help="Temperature Scaling für Confidence Calibration "
+                         "(1.0 = aus, >1 = konservativer, default 1.5)")
     ap.add_argument("--device", default="mps")
     ap.add_argument("--max-frames", type=int, default=0, help="Limit auf verarbeitete (gesampelte) Frames, 0=alle")
     ap.add_argument("--video-out", default="", help="optionales annotiertes Kontrollvideo")
@@ -98,6 +130,8 @@ def main():
     eff_fps = vi.fps / args.stride
     print(f"[info] {vi.width}x{vi.height} @ {vi.fps:.2f}fps, {vi.total_frames} frames "
           f"-> Sampling-Stride {args.stride} = {eff_fps:.2f}fps effektiv")
+    if args.temperature != 1.0:
+        print(f"[info] Confidence Calibration AKTIV (T={args.temperature})")
 
     tracker = sv.ByteTrack(frame_rate=max(1, int(round(eff_fps))))
 
@@ -163,6 +197,9 @@ def main():
         if args.max_frames and processed >= args.max_frames:
             break
         det = detect(frame)
+        # ---- Confidence Calibration: nach Detection, vor Tracking ----
+        if args.temperature != 1.0:
+            det = calibrate_confidence(det, args.temperature)
         if args.raw_out and len(det):
             t_raw = i / vi.fps
             for xyxy, conf in zip(det.xyxy, det.confidence):
