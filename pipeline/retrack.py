@@ -5,10 +5,18 @@ replayen — Parameter-Experimente in Sekunden statt erneuter YOLO-Inferenz.
 Danach optionales Gap-Stitching: Track endet bei (X,Y), anderer startet kurz
 danach in der Nähe -> gleiche Person (statische Nadir-Kamera macht das robust).
 
+Appearance-Features: Optionaler frozen MobileNetV3-Feature-Extraktor für
+Re-ID-basiertes Track-Stitching (--video + --alpha).
+
     .venv/bin/python pipeline/retrack.py --raw detections_raw.parquet \
         --homography homography.npz --out positions_cv2.parquet \
         --min-conf 0.05 --activation 0.20 --buffer 60 --stitch-gap 4.0 --stitch-dist 2.5
     (Defaults sind jetzt GT-validiert — obige Flags nur nötig wenn man abweichen will)
+
+    # Mit Appearance-Features:
+    .venv/bin/python pipeline/retrack.py --raw detections_raw.parquet \
+        --homography homography.npz --out positions_cv2.parquet \
+        --video clip5m.mkv --alpha 0.7
 """
 import argparse
 
@@ -16,6 +24,113 @@ import cv2
 import numpy as np
 import pandas as pd
 import supervision as sv
+
+# ---- Appearance Feature Extractor (lazy-loaded) ----
+
+_appearance_extractor = None
+
+
+class AppearanceExtractor:
+    """Frozen MobileNetV3-Small Feature-Extraktor für Re-ID Embeddings."""
+
+    def __init__(self, device: str = "cpu"):
+        import torch
+        import torchvision.models as models
+        import torchvision.transforms as T
+
+        self.device = torch.device(device)
+        backbone = models.mobilenet_v3_small(weights=models.MobileNet_V3_Small_Weights.DEFAULT)
+        backbone.eval()
+        # Entferne Classifier, behalte nur Feature-Extraktor + Pool
+        self.model = torch.nn.Sequential(
+            backbone.features,
+            backbone.avgpool,
+            torch.nn.Flatten(),
+        ).to(self.device)
+        for p in self.model.parameters():
+            p.requires_grad = False
+        self.transform = T.Compose([
+            T.ToPILImage(),
+            T.Resize((64, 64)),
+            T.ToTensor(),
+            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+        self._torch = torch
+
+    @torch.no_grad()
+    def extract(self, crops: list[np.ndarray]) -> np.ndarray:
+        """Extrahiere Embeddings für eine Liste von BGR-Crops.
+        Returns: (N, D) float32 numpy array, L2-normiert."""
+        import torch
+        if len(crops) == 0:
+            return np.zeros((0, 576), dtype=np.float32)
+        tensors = []
+        for c in crops:
+            if c.size == 0 or min(c.shape[:2]) < 4:
+                tensors.append(self.transform(np.zeros((64, 64, 3), dtype=np.uint8)))
+            else:
+                rgb = cv2.cvtColor(c, cv2.COLOR_BGR2RGB)
+                tensors.append(self.transform(rgb))
+        batch = torch.stack(tensors).to(self.device)
+        emb = self.model(batch).cpu().numpy()
+        # L2-Normierung
+        norms = np.linalg.norm(emb, axis=1, keepdims=True) + 1e-8
+        return (emb / norms).astype(np.float32)
+
+
+def _get_extractor(device: str = "cpu") -> AppearanceExtractor:
+    global _appearance_extractor
+    if _appearance_extractor is None:
+        _appearance_extractor = AppearanceExtractor(device)
+    return _appearance_extractor
+
+
+def compute_track_embeddings(df: pd.DataFrame, video_path: str,
+                             device: str = "cpu") -> dict[int, np.ndarray]:
+    """Berechne mittleres Appearance-Embedding pro Track aus Video-Crops.
+    Samplet bis zu 8 Frames pro Track für Effizienz."""
+    extractor = _get_extractor(device)
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"[warn] Video {video_path} nicht lesbar, Appearance deaktiviert")
+        return {}
+
+    track_crops: dict[int, list[np.ndarray]] = {}
+    max_samples = 8
+
+    for tid, g in df.groupby("tracker_id"):
+        tid = int(tid)
+        g = g.sort_values("frame")
+        # Sample gleichmäßig verteilt
+        indices = np.linspace(0, len(g) - 1, min(max_samples, len(g)), dtype=int)
+        sampled = g.iloc[indices]
+        crops = []
+        for _, row in sampled.iterrows():
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(row.frame))
+            ret, frame = cap.read()
+            if not ret:
+                continue
+            x, y, w, h = row.x_px, row.y_px, row.w_px, row.h_px
+            x1 = max(0, int(x - w / 2))
+            y1 = max(0, int(y - h / 2))
+            x2 = min(frame.shape[1], int(x + w / 2))
+            y2 = min(frame.shape[0], int(y + h / 2))
+            crop = frame[y1:y2, x1:x2]
+            if crop.size > 0:
+                crops.append(crop)
+        if crops:
+            track_crops[tid] = crops
+
+    cap.release()
+
+    # Embeddings berechnen
+    track_embeddings = {}
+    for tid, crops in track_crops.items():
+        embs = extractor.extract(crops)
+        track_embeddings[tid] = embs.mean(axis=0)  # Mittleres Embedding
+
+    print(f"[appearance] {len(track_embeddings)} Track-Embeddings berechnet")
+    return track_embeddings
 
 
 def dedup(raw: pd.DataFrame, H: np.ndarray, radius_m: float) -> pd.DataFrame:
@@ -79,10 +194,13 @@ def replay_bytetrack(raw: pd.DataFrame, fps_eff: float, activation: float,
 
 
 def stitch_tracks(df: pd.DataFrame, H: np.ndarray, max_gap_s: float,
-                  max_dist_m: float) -> pd.DataFrame:
+                  max_dist_m: float, alpha: float = 1.0,
+                  track_embeddings: dict | None = None) -> pd.DataFrame:
     """Greedy: Track-Ende -> nächster Track-Start (zeitlich) im Umkreis mergen.
     Velocity-aware: nutzt Geschwindigkeitsvektor am Track-Ende für
-    Positionsprädiktion über die Lücke hinweg."""
+    Positionsprädiktion über die Lücke hinweg.
+    Appearance-aware (optional): Cosine-Similarity der Track-Embeddings als
+    zusätzliches Matching-Signal: cost = alpha * pos_cost + (1-alpha) * app_cost"""
     pts = df[["x_px", "y_px"]].to_numpy(np.float64).reshape(-1, 1, 2)
     XY = cv2.perspectiveTransform(pts, H).reshape(-1, 2)
     df = df.copy()
@@ -119,11 +237,15 @@ def stitch_tracks(df: pd.DataFrame, H: np.ndarray, max_gap_s: float,
             t = parent[t]
         return t
 
+    use_appearance = (track_embeddings is not None and len(track_embeddings) > 0
+                      and alpha < 1.0)
+
     ends = sorted(info, key=lambda r: r["t1"])
     merged = 0
     used_starts = set()
     for end in ends:
         best = None
+        end_emb = track_embeddings.get(end["tid"]) if use_appearance else None
         for start in info:  # info ist nach t0 sortiert -> break erlaubt
             dt = start["t0"] - end["t1"]
             if dt > max_gap_s:
@@ -141,7 +263,22 @@ def stitch_tracks(df: pd.DataFrame, H: np.ndarray, max_gap_s: float,
             d = min(d_raw, d_pred)
             if d > max_dist_m:
                 continue
-            score = d + dt * 0.3
+
+            # Position-Score (normiert auf 0-1, 0=perfekt)
+            pos_score = d / max_dist_m + dt * 0.3 / max_gap_s
+
+            # Appearance-Score (Cosine Distance, 0=identisch, 2=maximal verschieden)
+            if use_appearance and end_emb is not None:
+                start_emb = track_embeddings.get(start["tid"])
+                if start_emb is not None:
+                    cos_sim = float(np.dot(end_emb, start_emb))
+                    app_score = 1.0 - cos_sim  # Cosine Distance
+                    score = alpha * pos_score + (1 - alpha) * app_score
+                else:
+                    score = pos_score
+            else:
+                score = pos_score
+
             if best is None or score < best[0]:
                 best = (score, start["tid"])
         if best is not None:
@@ -151,7 +288,8 @@ def stitch_tracks(df: pd.DataFrame, H: np.ndarray, max_gap_s: float,
                 used_starts.add(tgt)
                 merged += 1
     df["tracker_id"] = df["tracker_id"].map(lambda t: find(int(t)))
-    print(f"[stitch] {merged} Merges -> {df.tracker_id.nunique()} Tracks")
+    mode = f"alpha={alpha}" if use_appearance else "position-only"
+    print(f"[stitch] {merged} Merges -> {df.tracker_id.nunique()} Tracks ({mode})")
     return df.drop(columns=["X", "Y"])
 
 
@@ -171,6 +309,14 @@ def main():
                     help="Box-Inflation nur für IoU-Matching (z.B. 2.5)")
     ap.add_argument("--dedup-m", type=float, default=0.6,
                     help="Duplikat-Radius in Metern (z.B. 0.6), 0 = aus")
+    # ---- Appearance Re-ID ----
+    ap.add_argument("--video", default="",
+                    help="Pfad zum Quellvideo für Appearance-Feature-Extraktion")
+    ap.add_argument("--alpha", type=float, default=0.7,
+                    help="Gewichtung IoU vs. Appearance: cost = alpha*pos + (1-alpha)*app "
+                         "(1.0 = nur Position, 0.0 = nur Appearance, default 0.7)")
+    ap.add_argument("--appearance-device", default="cpu",
+                    help="Device für Feature-Extraktor (cpu/cuda/mps)")
     args = ap.parse_args()
 
     raw = pd.read_parquet(args.raw)
@@ -187,7 +333,12 @@ def main():
 
     if args.stitch_gap > 0:
         H = np.load(args.homography)["H"]
-        df = stitch_tracks(df, H, args.stitch_gap, args.stitch_dist)
+        # Appearance-Embeddings berechnen, falls Video angegeben
+        track_embs = None
+        if args.video and args.alpha < 1.0:
+            track_embs = compute_track_embeddings(df, args.video, args.appearance_device)
+        df = stitch_tracks(df, H, args.stitch_gap, args.stitch_dist,
+                           alpha=args.alpha, track_embeddings=track_embs)
 
     df.to_parquet(args.out, index=False)
     print(f"[done] -> {args.out}")
