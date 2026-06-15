@@ -57,3 +57,6 @@ tt_detect_*.png
 overlay_check*.png
 homography.npz
 points.json
+
+# verify-gate disposable loop memory (next_steps.md)
+.loop/

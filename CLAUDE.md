@@ -77,3 +77,53 @@ MUSS gegen diese Baseline laufen: `pipeline/compare_to_gt.py`. Verschlechterung 
   Downloads sind reproduzierbar.
 - ❌ Tier-B-Features (Passoptionen, Possession, Events) nicht „nebenbei" anfangen —
   erst Tier A auf <5 % bringen (Roadmap: `docs/ROADMAP_FULL_GAME.md`).
+
+## Autonomie- & Risiko-Vertrag
+
+Maßgeblich ist der zentrale Skill `quershift-skills:autonomy-contract` (org-distribuiert via
+`quershift-skills@quershift`). Kurzfassung, verbindlich für Main-Loop, Subagents und Hermes:
+
+- **Zwei-Phasen-Modell:** Genau EIN gebündeltes Rückfrage-Fenster sofort nach dem Prompt (nur
+  echte, nicht selbst auflösbare Mehrdeutigkeiten) — danach volle Autonomie, null Rückfragen,
+  am Ende berichten.
+- **Risiko-Affinität:** Handeln schlägt fragen. Fehler im Reversiblen sind gratis und erwartet
+  — reinhauen, selbst per Gate (Tests / `verify-gate`) erwischen, fixen, weiter. Sicher nur,
+  WEIL das Gate fängt; gegated wird ausschließlich das Irreversible.
+- **Kein nacktes A/B:** Gegen das Ziel rankbar → empfehlen UND machen, nicht stehenbleiben.
+- **Harte Ausnahmen (immer vorher Freigabe):** E-Mails/externe Nachrichten · vertrauliche Daten
+  nach außen · irreversible Infra/Daten (prod-DB-delete, force-push main/shared, Schema-Wipe
+  Live-DB, Traffic-100%-auf-ungeprüfte-Revision) · Geld/Verträge.
+- **Verifikation Pflicht:** Kein Erfolgsclaim ohne frisch ausgeführten Beleg
+  (Exit-Code/Output/Diff). SKIP ist kein PASS.
+
+
+## Loop-Konvention (autonom entwickeln)
+
+Der autonome Goal-Loop ist hier „direkt drin". Die Tools liegen GLOBAL unter
+`~/.claude/skills/verify-gate/` (`gate.sh` / `discover.sh` / `loop.sh`) — in DIESEM Repo
+brauchst du nur die Konvention unten. Ablauf:
+
+```bash
+# 1) Schnell-Gate (Tier-0: lint/type/import-smoke/FE-check, Sekunden)
+~/.claude/skills/verify-gate/gate.sh . --fast
+
+# 2) Discovery: füllt .loop/next_steps.md aus Gate-RED + TODO/FIXME + CI-Failures (read-only am Repo)
+~/.claude/skills/verify-gate/discover.sh .
+
+# 3) Autonomer Loop bis verify-gate GREEN bzw. <promise>COMPLETE</promise>-Sentinel
+~/.claude/skills/verify-gate/loop.sh --repo . --goal "<ziel>"
+#   --goal ist optional, wenn .loop/next_steps.md offene Items hat (die sind dann das Ziel).
+```
+
+- **verify-gate ist die Abbruchbedingung:** RED → iterieren; GREEN → mergebar / Ziel erreicht.
+  Das Loop-Memory `.loop/next_steps.md` ist disposable (gitignored), die abgehakten Items +
+  `<promise>COMPLETE</promise>` sind das deterministische Done-Signal.
+- **Nur Irreversibles ist gegated.** Im Reversiblen volle Autonomie (Autonomie-/Risiko-Vertrag oben).
+  Gegated bleiben ausschließlich: 0%-Canary, Traffic-Shift, prod-DB-Delete, force-push,
+  Schema-Wipe, Geld/Verträge, externe Nachrichten.
+- **Merge bei grün via safe-merge**, nie `gh pr merge` direkt:
+  `scripts/safe-merge.sh <PR>` (blockt pending/failed CI), sofern im Repo vorhanden.
+
+**Repo-spezifische Gate-/Test-Befehle** (sonst nutzt `gate.sh` seine Stack-Autodetektion):
+- Python-Pipeline (requirements.txt, `tests/`): `pytest tests/ -x`. `gate.sh` erkennt den Python-Stack automatisch.
+- GPU-Check separat: `scripts/verify_gpu.py` (nur wo CUDA relevant).
