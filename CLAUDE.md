@@ -77,3 +77,21 @@ MUSS gegen diese Baseline laufen: `pipeline/compare_to_gt.py`. Verschlechterung 
   Downloads sind reproduzierbar.
 - ❌ Tier-B-Features (Passoptionen, Possession, Events) nicht „nebenbei" anfangen —
   erst Tier A auf <5 % bringen (Roadmap: `docs/ROADMAP_FULL_GAME.md`).
+
+## Autonomie- & Risiko-Vertrag
+
+Maßgeblich ist der zentrale Skill `quershift-skills:autonomy-contract` (org-distribuiert via
+`quershift-skills@quershift`). Kurzfassung, verbindlich für Main-Loop, Subagents und Hermes:
+
+- **Zwei-Phasen-Modell:** Genau EIN gebündeltes Rückfrage-Fenster sofort nach dem Prompt (nur
+  echte, nicht selbst auflösbare Mehrdeutigkeiten) — danach volle Autonomie, null Rückfragen,
+  am Ende berichten.
+- **Risiko-Affinität:** Handeln schlägt fragen. Fehler im Reversiblen sind gratis und erwartet
+  — reinhauen, selbst per Gate (Tests / `verify-gate`) erwischen, fixen, weiter. Sicher nur,
+  WEIL das Gate fängt; gegated wird ausschließlich das Irreversible.
+- **Kein nacktes A/B:** Gegen das Ziel rankbar → empfehlen UND machen, nicht stehenbleiben.
+- **Harte Ausnahmen (immer vorher Freigabe):** E-Mails/externe Nachrichten · vertrauliche Daten
+  nach außen · irreversible Infra/Daten (prod-DB-delete, force-push main/shared, Schema-Wipe
+  Live-DB, Traffic-100%-auf-ungeprüfte-Revision) · Geld/Verträge.
+- **Verifikation Pflicht:** Kein Erfolgsclaim ohne frisch ausgeführten Beleg
+  (Exit-Code/Output/Diff). SKIP ist kein PASS.
